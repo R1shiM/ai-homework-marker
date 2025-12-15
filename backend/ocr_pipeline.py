@@ -1,9 +1,13 @@
 import base64
 import json
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
+import fitz  # PyMuPDF
 from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 VISION_MODEL = "gpt-4.1-mini"
 
@@ -15,21 +19,40 @@ def _client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
-def _image_to_data_url(path: str) -> str:
+def _to_data_url_bytes(b: bytes, mime: str) -> str:
+    b64 = base64.b64encode(b).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
+def _guess_mime_from_path(path: str) -> str:
+    ext = os.path.splitext(path.lower())[1]
+    if ext in [".png"]:
+        return "image/png"
+    return "image/jpeg"
+
+
+def _image_file_to_data_url(path: str) -> str:
     with open(path, "rb") as f:
         b = f.read()
-    b64 = base64.b64encode(b).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
+    return _to_data_url_bytes(b, _guess_mime_from_path(path))
 
 
-def extract_qa_from_image(image_path: str) -> List[Dict[str, Any]]:
-    """
-    Given one worksheet image (questions + student answers),
-    return a list of dicts with question + student's answer.
-    """
-    client = _client()
-    image_data_url = _image_to_data_url(image_path)
+def _pdf_to_page_data_urls(pdf_path: str, zoom: float = 2.0) -> List[str]:
+    doc = fitz.open(pdf_path)
+    out: List[str] = []
 
+    mat = fitz.Matrix(zoom, zoom)
+
+    for i in range(len(doc)):
+        page = doc[i]
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        png_bytes = pix.tobytes("png")
+        out.append(_to_data_url_bytes(png_bytes, "image/png"))
+
+    return out
+
+
+def _extract_qa_from_one_page(client: OpenAI, image_data_url: str, page_number: Optional[int]) -> List[Dict[str, Any]]:
     prompt = """
 I have a Year 5–8 maths worksheet in the image.
 
@@ -74,7 +97,7 @@ Return ONLY a JSON array, like:
                 ],
             }
         ],
-        max_output_tokens=800,
+        max_output_tokens=900,
     )
 
     raw = resp.output_text.strip()
@@ -102,20 +125,43 @@ Return ONLY a JSON array, like:
         if not qn and not qtext:
             continue
 
-        cleaned.append(
-            {
-                "question_number": qn,
-                "question_text": qtext,
-                "student_answer": sans,
-                "student_working": work,
-            }
-        )
+        entry = {
+            "question_number": qn,
+            "question_text": qtext,
+            "student_answer": sans,
+            "student_working": work,
+        }
+
+        if page_number is not None:
+            entry["page_number"] = page_number
+
+        cleaned.append(entry)
 
     return cleaned
 
 
+def extract_qa_from_file(path: str) -> List[Dict[str, Any]]:
+    client = _client()
+    ext = os.path.splitext(path.lower())[1]
+
+    if ext == ".pdf":
+        page_urls = _pdf_to_page_data_urls(path, zoom=2.0)
+        all_items: List[Dict[str, Any]] = []
+
+        for idx, page_url in enumerate(page_urls, start=1):
+            page_items = _extract_qa_from_one_page(client, page_url, page_number=idx)
+            all_items.extend(page_items)
+
+        return all_items
+
+    image_url = _image_file_to_data_url(path)
+    return _extract_qa_from_one_page(client, image_url, page_number=None)
+
+
 if __name__ == "__main__":
-    # quick local poke
-    sample = os.path.join("..", "sample_data", "worksheet1.jpg")
-    qa = extract_qa_from_image(sample)
+    sample_img = os.path.join("..", "sample_data", "worksheet1.jpg")
+    sample_pdf = os.path.join("..", "sample_data", "worksheet1.pdf")
+
+    path = sample_pdf if os.path.exists(sample_pdf) else sample_img
+    qa = extract_qa_from_file(path)
     print(json.dumps(qa, indent=2, ensure_ascii=False))
