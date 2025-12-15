@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 from typing import List, Dict, Any, Optional
 
 import fitz  # PyMuPDF
@@ -26,7 +27,7 @@ def _to_data_url_bytes(b: bytes, mime: str) -> str:
 
 def _guess_mime_from_path(path: str) -> str:
     ext = os.path.splitext(path.lower())[1]
-    if ext in [".png"]:
+    if ext == ".png":
         return "image/png"
     return "image/jpeg"
 
@@ -52,7 +53,36 @@ def _pdf_to_page_data_urls(pdf_path: str, zoom: float = 2.0) -> List[str]:
     return out
 
 
-def _extract_qa_from_one_page(client: OpenAI, image_data_url: str, page_number: Optional[int]) -> List[Dict[str, Any]]:
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+
+def _parse_json_loose(raw: str) -> Any:
+    raw = _strip_code_fences(raw)
+
+    start_idx = None
+    for i, ch in enumerate(raw):
+        if ch in "{[":
+            start_idx = i
+            break
+    if start_idx is None:
+        raise json.JSONDecodeError("No JSON object/array start found", raw, 0)
+
+    candidate = raw[start_idx:]
+    decoder = json.JSONDecoder()
+    obj, _end = decoder.raw_decode(candidate)
+    return obj
+
+
+def _extract_qa_from_one_page(
+    client: OpenAI,
+    image_data_url: str,
+    page_number: Optional[int],
+) -> List[Dict[str, Any]]:
     prompt = """
 I have a Year 5–8 maths worksheet in the image.
 
@@ -103,7 +133,7 @@ Return ONLY a JSON array, like:
     raw = resp.output_text.strip()
 
     try:
-        data = json.loads(raw)
+        data = _parse_json_loose(raw)
     except json.JSONDecodeError:
         print("Vision model JSON parse failed. Raw output below:\n")
         print(raw)
@@ -125,7 +155,7 @@ Return ONLY a JSON array, like:
         if not qn and not qtext:
             continue
 
-        entry = {
+        entry: Dict[str, Any] = {
             "question_number": qn,
             "question_text": qtext,
             "student_answer": sans,
