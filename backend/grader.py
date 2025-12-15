@@ -1,21 +1,21 @@
 import json
 import os
 import re
+import string
+from decimal import Decimal, InvalidOperation, getcontext
 from typing import List, Dict, Any, Optional, Tuple
-from collections import defaultdict, Counter
 
 from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-TEXT_MODEL = "gpt-4.1-mini"
+# Increase precision for big-number arithmetic (money, large integers, etc.)
+getcontext().prec = 50
 
-BATCH_MAX_ITEMS = 6
-BATCH_MAX_CHARS = 2600
-RETRIES = 3
+TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-5-chat-latest")
 
-BLANK_TOKENS = {"", "BLANK", "UNREADABLE"}
+RETRIES = 2  # for LLM-only (non-deterministic) questions
 
 
 def _client() -> OpenAI:
@@ -38,332 +38,325 @@ def _key(page: Optional[int], qn: str) -> Tuple[Optional[int], str]:
     return (page, qn.strip())
 
 
-def _estimate_chars(items: List[Dict[str, Any]]) -> int:
-    total = 0
-    for it in items:
-        total += len(str(it.get("question_text", "")))
-        total += len(str(it.get("student_answer", "")))
-        total += len(str(it.get("student_working", "")))
-    return total
-
-
-def _should_batch_page(items: List[Dict[str, Any]]) -> bool:
-    if len(items) == 0:
-        return False
-    if len(items) > BATCH_MAX_ITEMS:
-        return False
-    if _estimate_chars(items) > BATCH_MAX_CHARS:
-        return False
-
-    qnums = [str(it.get("question_number", "")).strip() for it in items]
-    if any(not q for q in qnums):
-        return False
-    if any(c > 1 for c in Counter(qnums).values()):
-        return False
-
-    return True
-
-
 def _strip_code_fences(s: str) -> str:
+    # Just in case, but json_schema should prevent fences.
     s = s.strip()
     if s.startswith("```"):
-        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
-        s = re.sub(r"\s*```$", "", s)
+        s = re.sub(r"^```[a-zA-Z]*\n?", "", s)
+        s = re.sub(r"\n?```$", "", s)
     return s.strip()
 
 
-def _parse_json_loose(raw: str) -> Any:
-    raw = _strip_code_fences(raw)
-
-    start_idx = None
-    for i, ch in enumerate(raw):
-        if ch in "{[":
-            start_idx = i
-            break
-    if start_idx is None:
-        raise json.JSONDecodeError("No JSON object/array start found", raw, 0)
-
-    candidate = raw[start_idx:]
-    decoder = json.JSONDecoder()
-    obj, _end = decoder.raw_decode(candidate)
-    return obj
-
-
-_NUM_RE = re.compile(r"[-+]?\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\$?\d+(?:\.\d+)?")
-_WS_RE = re.compile(r"\s+")
-
-
-def _clean_text(s: str) -> str:
-    s = s.strip()
-    s = _WS_RE.sub(" ", s)
+def _normalize_text_for_compare(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("–", "-").replace("—", "-").replace("×", "*")
+    s = re.sub(r"\s+", " ", s)
+    # remove surrounding punctuation
+    s = s.strip(string.punctuation + " ")
     return s
 
 
-def _extract_numbers(s: str) -> List[str]:
-    s = s.replace("−", "-").replace("–", "-").replace("—", "-")
-    nums = _NUM_RE.findall(s)
-    return [n.strip() for n in nums]
+_NUM_RE = re.compile(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?")
 
 
-def _to_float_token(tok: str) -> Optional[float]:
-    tok = tok.strip()
-    tok = tok.replace("$", "").replace(",", "")
-    if tok in {"", "-", "+", "."}:
+def _extract_first_number(s: str) -> Optional[str]:
+    if not s:
+        return None
+    m = _NUM_RE.search(s)
+    return m.group(0) if m else None
+
+
+def _to_decimal(num_str: str) -> Optional[Decimal]:
+    if not num_str:
         return None
     try:
-        return float(tok)
-    except ValueError:
+        cleaned = num_str.replace(",", "").strip()
+        # strip leading currency symbols
+        cleaned = cleaned.replace("$", "")
+        return Decimal(cleaned)
+    except (InvalidOperation, AttributeError):
         return None
 
 
-def _numeric_equivalent(a: str, b: str, tol: float = 1e-9) -> bool:
-    af = _to_float_token(a)
-    bf = _to_float_token(b)
-    if af is None or bf is None:
+def _format_decimal(d: Decimal) -> str:
+    # format without scientific notation, remove trailing zeros
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
+def _numeric_equal(student: str, correct: str, tol: Decimal = Decimal("0")) -> bool:
+    # tol=0 means exact numeric equality for Decimals
+    sn = _extract_first_number(student)
+    cn = _extract_first_number(correct)
+    sd = _to_decimal(sn) if sn else None
+    cd = _to_decimal(cn) if cn else None
+    if sd is None or cd is None:
         return False
-    return abs(af - bf) <= tol
+    return abs(sd - cd) <= tol
 
 
-def _numbers_equivalent(student: str, correct: str) -> Optional[bool]:
-    s_nums = _extract_numbers(student)
-    c_nums = _extract_numbers(correct)
+# -----------------------------
+# Multi-part expansion
+# -----------------------------
+# Matches lines like:
+#   128 + 284 = 412
+#   4510044 - 3625931 = 884,113
+_ARITH_LINE = re.compile(
+    r"^\s*([0-9][0-9,\.]*)\s*([+\-*/])\s*([0-9][0-9,\.]*)\s*=\s*([0-9][0-9,\.]*)\s*$"
+)
 
-    if not s_nums or not c_nums:
-        return None
-
-    # single number vs single number
-    if len(s_nums) == 1 and len(c_nums) == 1:
-        return _numeric_equivalent(s_nums[0], c_nums[0])
-
-    # list/tuple-y answers: compare numeric sequences exactly
-    s_vals = [_to_float_token(x) for x in s_nums]
-    c_vals = [_to_float_token(x) for x in c_nums]
-    if any(v is None for v in s_vals) or any(v is None for v in c_vals):
-        return None
-
-    if len(s_vals) != len(c_vals):
-        return False
-
-    for sv, cv in zip(s_vals, c_vals):
-        if abs(sv - cv) > 1e-9:
-            return False
-    return True
+# Also handle "a + b" without "=" (sometimes in printed text)
+_ARITH_EXPR = re.compile(r"^\s*([0-9][0-9,\.]*)\s*([+\-*/])\s*([0-9][0-9,\.]*)\s*$")
 
 
-def _solve_one(client: OpenAI, qa: Dict[str, Any], attempts: int = RETRIES) -> Dict[str, Any]:
+def _split_student_answer_list(ans: str) -> List[str]:
+    """
+    Turns things like:
+      "523, 144, 139, 1555, 1929, 3679"
+      "52 154 26664 215 422 166665"
+    into a list of tokens (best-effort).
+    """
+    if not ans:
+        return []
+    # normalize separators
+    s = ans.strip()
+    s = s.replace("\n", " ").replace(";", " ").replace(" and ", " ")
+    # split on commas OR whitespace
+    parts = re.split(r"[,\s]+", s)
+    parts = [p for p in parts if p.strip()]
+    return parts
+
+
+def _suffix_letters(n: int) -> str:
+    # 0->a, 1->b, ..., 25->z, 26->aa...
+    out = ""
+    n += 1
+    while n > 0:
+        n -= 1
+        out = chr(ord("a") + (n % 26)) + out
+        n //= 26
+    return out
+
+
+def _expand_multi_part(qa: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    If we see multiple arithmetic lines in working, split into sub-questions:
+      qn "2" -> "2a", "2b", ...
+    If student_answer is a list, align it by order.
+    """
     page = _norm_page(qa.get("page_number"))
     qn = str(qa.get("question_number", "")).strip()
     qtext = str(qa.get("question_text", "")).strip()
+    sans = str(qa.get("student_answer", "")).strip()
+    work = str(qa.get("student_working", "")).strip()
 
-    prompt = "\n".join(
-        [
-            f"PAGE: {page if page is not None else 'null'}",
-            f"QID: {qn}",
-            f"Question: {qtext}",
-        ]
-    )
+    if not qn:
+        return [qa]
 
-    instructions = """
-Solve ONE Year 5–8 maths question.
+    lines = [ln.strip() for ln in work.splitlines() if ln.strip()]
+    arith_lines = []
+    for ln in lines:
+        m = _ARITH_LINE.match(ln.replace("×", "*"))
+        if m:
+            a, op, b, c = m.groups()
+            arith_lines.append((a, op, b, c, ln))
 
-Return ONLY raw JSON (no markdown) as one object:
-{
-  "page_number": <integer or null>,
-  "question_number": "<exact QID>",
-  "correct_answer": "<final answer only, concise>"
-}
+    # If working contains 2+ arithmetic lines, treat as multi-part
+    if len(arith_lines) >= 2:
+        ans_parts = _split_student_answer_list(sans)
+        out: List[Dict[str, Any]] = []
+        for i, (a, op, b, c, ln) in enumerate(arith_lines):
+            sub_qn = f"{qn}{_suffix_letters(i)}"
+            # prefer explicit "= c" from working; else align from student_answer list
+            sub_student = c
+            if ans_parts and i < len(ans_parts):
+                sub_student = ans_parts[i]
 
-Don't include working unless it's required to define the final answer (e.g., list of pairs).
-""".strip()
+            out.append(
+                {
+                    "page_number": page,
+                    "question_number": sub_qn,
+                    "question_text": f"{qtext}  [{a} {op} {b}]",
+                    "student_answer": sub_student,
+                    "student_working": ln,
+                    "_derived_from": qn,
+                }
+            )
+        return out
 
-    last_raw = ""
-    for _ in range(attempts):
-        resp = client.responses.create(
-            model=TEXT_MODEL,
-            instructions=instructions,
-            input=prompt,
-            max_output_tokens=350,
-        )
-        raw = resp.output_text.strip()
-        last_raw = raw
+    return [qa]
 
-        try:
-            obj = _parse_json_loose(raw)
-        except json.JSONDecodeError:
-            continue
 
-        if not isinstance(obj, dict):
-            continue
+def _expand_all(qa_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    expanded: List[Dict[str, Any]] = []
+    for qa in qa_items:
+        expanded.extend(_expand_multi_part(qa))
+    return expanded
 
-        return {
-            "page_number": _norm_page(obj.get("page_number", page)),
-            "question_number": str(obj.get("question_number", qn)).strip() or qn,
-            "correct_answer": str(obj.get("correct_answer", "")).strip(),
-        }
+def _try_grade_arithmetic(qa: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    If the question is a simple binary arithmetic expression (from our expansion),
+    compute correct answer in Python and grade deterministically.
+    """
+    page = _norm_page(qa.get("page_number"))
+    qn = str(qa.get("question_number", "")).strip()
+    qtext = str(qa.get("question_text", "")).strip()
+    sans = str(qa.get("student_answer", "")).strip()
+    work = str(qa.get("student_working", "")).strip()
 
-    print("Solve parse failed after retries (single). Raw output below:\n")
-    print(last_raw)
+    # Prefer extracting from the bracketed "[a op b]" we add during expansion.
+    bracket = re.search(r"\[([0-9][0-9,\.]*)\s*([+\-*/])\s*([0-9][0-9,\.]*)\]", qtext)
+    expr = None
+    if bracket:
+        expr = f"{bracket.group(1)} {bracket.group(2)} {bracket.group(3)}"
+    else:
+        # fallback: if student_working is literally "a op b = c"
+        m = _ARITH_LINE.match(work.replace("×", "*"))
+        if m:
+            expr = f"{m.group(1)} {m.group(2)} {m.group(3)}"
+        else:
+            # last fallback: if question_text itself is "a op b"
+            m2 = _ARITH_EXPR.match(qtext.replace("×", "*"))
+            if m2:
+                expr = f"{m2.group(1)} {m2.group(2)} {m2.group(3)}"
+
+    if not expr:
+        return None
+
+    m = _ARITH_EXPR.match(expr.replace("×", "*").strip())
+    if not m:
+        return None
+
+    a_s, op, b_s = m.groups()
+    a = _to_decimal(a_s)
+    b = _to_decimal(b_s)
+    if a is None or b is None:
+        return None
+
+    try:
+        if op == "+":
+            correct = a + b
+        elif op == "-":
+            correct = a - b
+        elif op == "*":
+            correct = a * b
+        elif op == "/":
+            # avoid division by zero
+            if b == 0:
+                return None
+            correct = a / b
+        else:
+            return None
+    except Exception:
+        return None
+
+    correct_str = _format_decimal(correct)
+
+    # If student answer is blank/unreadable
+    if sans.strip().upper() in {"", "BLANK", "UNREADABLE"}:
+        score = 0
+        feedback = "No answer provided."
+    else:
+        # numeric compare (tolerance 0 by default)
+        ok = _numeric_equal(sans, correct_str, tol=Decimal("0"))
+        score = 1 if ok else 0
+        feedback = "Correct." if ok else f"Incorrect. Correct answer: {correct_str}"
 
     return {
         "page_number": page,
         "question_number": qn,
-        "correct_answer": "",
+        "score": score,
+        "max_score": 1,
+        "correct_answer": correct_str,
+        "feedback": feedback,
     }
 
+def _llm_grade_one(client: OpenAI, qa: Dict[str, Any], attempts: int = RETRIES) -> Dict[str, Any]:
+    page = _norm_page(qa.get("page_number"))
+    qn = str(qa.get("question_number", "")).strip()
+    qtext = str(qa.get("question_text", "")).strip()
+    sans = str(qa.get("student_answer", "")).strip()
+    work = str(qa.get("student_working", "")).strip()
 
-def _solve_page_batch(
-    client: OpenAI,
-    page: Optional[int],
-    items: List[Dict[str, Any]],
-    attempts: int = RETRIES,
-) -> Optional[List[Dict[str, Any]]]:
-    blocks = [f"PAGE: {page if page is not None else 'null'}", ""]
+    prompt_lines = []
+    prompt_lines.append(f"PAGE: {page if page is not None else 'null'}")
+    prompt_lines.append(f"QUESTION_NUMBER: {qn}")
+    prompt_lines.append(f"QUESTION_TEXT: {qtext}")
+    if work:
+        prompt_lines.append(f"STUDENT_WORKING: {work}")
+    prompt_lines.append(f"STUDENT_FINAL_ANSWER: {sans}")
 
-    for it in items:
-        qn = str(it.get("question_number", "")).strip()
-        qtext = str(it.get("question_text", "")).strip()
-        blocks.append(f"QID: {qn}")
-        blocks.append(f"Question: {qtext}")
-        blocks.append("")
-
-    prompt = "\n".join(blocks)
-
-    instructions = """
-Solve MULTIPLE Year 5–8 maths questions from the same page.
-
-Return ONLY raw JSON (no markdown) as an array.
-Each item:
-{
-  "page_number": <integer or null>,
-  "question_number": "<exact QID>",
-  "correct_answer": "<final answer only, concise>"
-}
-""".strip()
-
-    last_raw = ""
-    for _ in range(attempts):
-        resp = client.responses.create(
-            model=TEXT_MODEL,
-            instructions=instructions,
-            input=prompt,
-            max_output_tokens=900,
-        )
-        raw = resp.output_text.strip()
-        last_raw = raw
-
-        try:
-            arr = _parse_json_loose(raw)
-        except json.JSONDecodeError:
-            continue
-
-        if not isinstance(arr, list):
-            continue
-
-        solved_by_key: Dict[Tuple[Optional[int], str], Dict[str, Any]] = {}
-        for obj in arr:
-            if not isinstance(obj, dict):
-                continue
-            p = _norm_page(obj.get("page_number", page))
-            qn = str(obj.get("question_number", "")).strip()
-            if not qn:
-                continue
-            solved_by_key[_key(p, qn)] = {
-                "page_number": p,
-                "question_number": qn,
-                "correct_answer": str(obj.get("correct_answer", "")).strip(),
-            }
-
-        out: List[Dict[str, Any]] = []
-        for it in items:
-            p = _norm_page(it.get("page_number"))
-            qn = str(it.get("question_number", "")).strip()
-            k = _key(p, qn)
-            if k not in solved_by_key:
-                return None
-            out.append(solved_by_key[k])
-
-        return out
-
-    print("Solve parse failed after retries (batch). Raw output below:\n")
-    print(last_raw)
-    return None
-
-
-def _judge_equivalence_llm(
-    client: OpenAI,
-    page: Optional[int],
-    qn: str,
-    qtext: str,
-    student_answer: str,
-    correct_answer: str,
-    attempts: int = RETRIES,
-) -> Dict[str, Any]:
-    prompt = "\n".join(
-        [
-            f"PAGE: {page if page is not None else 'null'}",
-            f"QID: {qn}",
-            f"Question: {qtext}",
-            f"Student final answer: {student_answer}",
-            f"Correct answer: {correct_answer}",
-        ]
-    )
+    qa_block = "\n".join(prompt_lines)
 
     instructions = """
-Decide if the student's final answer is correct.
+You are marking ONE Year 5–8 maths question.
 
 Rules:
-- score = 1 if correct (equivalent forms allowed)
+- score = 1 if the student's final answer is mathematically correct (equivalent forms allowed)
 - score = 0 if wrong, BLANK, or UNREADABLE
 - max_score is always 1
 
-Return ONLY raw JSON (no markdown):
-{
-  "page_number": <integer or null>,
-  "question_number": "<exact QID>",
-  "score": 0 or 1,
-  "max_score": 1,
-  "feedback": "<short>"
-}
+Return STRICT JSON matching the schema.
 """.strip()
+
+    schema = {
+        "name": "grade_item",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "page_number": {"type": ["integer", "null"]},
+                "question_number": {"type": "string"},
+                "score": {"type": "integer", "enum": [0, 1]},
+                "max_score": {"type": "integer", "enum": [1]},
+                "correct_answer": {"type": "string"},
+                "feedback": {"type": "string"},
+            },
+            "required": ["page_number", "question_number", "score", "max_score", "correct_answer", "feedback"],
+        },
+        "strict": True,
+    }
 
     last_raw = ""
     for _ in range(attempts):
         resp = client.responses.create(
             model=TEXT_MODEL,
             instructions=instructions,
-            input=prompt,
+            input=qa_block,
+            temperature=0,
+            #response_format={"type": "json_schema", "json_schema": schema},
             max_output_tokens=350,
         )
-        raw = resp.output_text.strip()
+
+        raw = (resp.output_text or "").strip()
         last_raw = raw
 
         try:
-            obj = _parse_json_loose(raw)
+            obj = json.loads(_strip_code_fences(raw))
         except json.JSONDecodeError:
             continue
 
         if not isinstance(obj, dict):
             continue
 
-        return {
-            "page_number": _norm_page(obj.get("page_number", page)),
-            "question_number": str(obj.get("question_number", qn)).strip() or qn,
-            "score": int(obj.get("score", 0)),
-            "max_score": 1,
-            "feedback": str(obj.get("feedback", "")).strip(),
-        }
+        # enforce page/qn fallback
+        obj["page_number"] = _norm_page(obj.get("page_number", page))
+        obj["question_number"] = str(obj.get("question_number", qn)).strip() or qn
+        return obj
 
-    print("Judge parse failed after retries. Raw output below:\n")
+    # fallback
+    print("LLM grading failed (invalid JSON). Raw output:\n")
     print(last_raw)
-
     return {
         "page_number": page,
         "question_number": qn,
         "score": 0,
         "max_score": 1,
-        "feedback": "Judging failed (unparseable model output). Needs manual review.",
+        "correct_answer": "",
+        "feedback": "Grading failed (invalid model output). Needs manual review.",
     }
-
 
 def grade_math_qa(qa_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not qa_items:
@@ -371,103 +364,41 @@ def grade_math_qa(qa_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     client = _client()
 
-    # group by page
-    grouped: Dict[Optional[int], List[Dict[str, Any]]] = defaultdict(list)
-    for qa in qa_items:
-        grouped[_norm_page(qa.get("page_number"))].append(qa)
+    # 1) Expand multi-part arithmetic into subquestions (2a, 2b, ...)
+    expanded = _expand_all(qa_items)
 
-    # STEP 1: SOLVE (no student answers involved)
-    solved_map: Dict[Tuple[Optional[int], str], str] = {}
-
-    for page in sorted(grouped.keys(), key=lambda x: (-1 if x is None else x)):
-        items = grouped[page]
-
-        solved_batch: Optional[List[Dict[str, Any]]] = None
-        if _should_batch_page(items):
-            solved_batch = _solve_page_batch(client, page, items, attempts=RETRIES)
-
-        if solved_batch is not None:
-            for s in solved_batch:
-                solved_map[_key(s.get("page_number"), s.get("question_number", ""))] = str(
-                    s.get("correct_answer", "")
-                ).strip()
-        else:
-            for it in items:
-                s = _solve_one(client, it, attempts=RETRIES)
-                solved_map[_key(s.get("page_number"), s.get("question_number", ""))] = str(
-                    s.get("correct_answer", "")
-                ).strip()
-
-    #  STEP 2: SCORE (code first, LLM only if needed)
     out: List[Dict[str, Any]] = []
+    seen_keys = set()
 
-    for qa in qa_items:
+    for qa in expanded:
         page = _norm_page(qa.get("page_number"))
         qn = str(qa.get("question_number", "")).strip()
-        qtext = str(qa.get("question_text", "")).strip()
-        student = _clean_text(str(qa.get("student_answer", "") or "").strip())
-        correct = _clean_text(solved_map.get(_key(page, qn), "") or "")
-
-        if student.upper() in BLANK_TOKENS:
-            out.append(
-                {
-                    "page_number": page,
-                    "question_number": qn,
-                    "score": 0,
-                    "max_score": 1,
-                    "correct_answer": correct,
-                    "feedback": "No answer provided." if student.upper() in {"", "BLANK"} else "Answer unreadable.",
-                }
-            )
+        if not qn:
             continue
 
-        # deterministic numeric check (single numbers OR numeric sequences)
-        num_eq = _numbers_equivalent(student, correct)
-        if num_eq is True:
-            out.append(
-                {
-                    "page_number": page,
-                    "question_number": qn,
-                    "score": 1,
-                    "max_score": 1,
-                    "correct_answer": correct,
-                    "feedback": "Correct.",
-                }
-            )
-            continue
-        if num_eq is False:
-            out.append(
-                {
-                    "page_number": page,
-                    "question_number": qn,
-                    "score": 0,
-                    "max_score": 1,
-                    "correct_answer": correct,
-                    "feedback": f"Incorrect. Correct answer: {correct}" if correct else "Incorrect.",
-                }
-            )
+        k = _key(page, qn)
+        if k in seen_keys:
+            # avoid collisions if OCR duplicates question numbers on same page
+            # append a suffix to force uniqueness
+            i = 1
+            new_qn = f"{qn}_{i}"
+            while _key(page, new_qn) in seen_keys:
+                i += 1
+                new_qn = f"{qn}_{i}"
+            qa["question_number"] = new_qn
+            qn = new_qn
+            k = _key(page, qn)
+
+        seen_keys.add(k)
+
+        # 2) Deterministic grade for arithmetic
+        det = _try_grade_arithmetic(qa)
+        if det is not None:
+            out.append(det)
             continue
 
-        # fallback: text/logic answers (or unclear formats)
-        judged = _judge_equivalence_llm(
-            client,
-            page=page,
-            qn=qn,
-            qtext=qtext,
-            student_answer=student,
-            correct_answer=correct,
-            attempts=RETRIES,
-        )
-        out.append(
-            {
-                "page_number": page,
-                "question_number": qn,
-                "score": int(judged.get("score", 0)),
-                "max_score": 1,
-                "correct_answer": correct,
-                "feedback": str(judged.get("feedback", "")).strip(),
-            }
-        )
+        # 3) Otherwise LLM grade with strict schema
+        out.append(_llm_grade_one(client, qa, attempts=RETRIES))
 
     return out
 
@@ -476,16 +407,16 @@ if __name__ == "__main__":
     fake_qa = [
         {
             "page_number": 1,
-            "question_number": "1",
-            "question_text": "Calculate 3 × 7.",
-            "student_answer": "21",
-            "student_working": "",
+            "question_number": "2",
+            "question_text": "Solve the following problems.",
+            "student_answer": "",
+            "student_working": "128 + 284 = 412\n34 + 28 = 62\n64 + 48 = 112",
         },
         {
             "page_number": 1,
-            "question_number": "2",
-            "question_text": "What is 2/5 as a decimal?",
-            "student_answer": "0.40",
+            "question_number": "3",
+            "question_text": "What is the smallest prime bigger than 17?",
+            "student_answer": "19",
             "student_working": "",
         },
     ]

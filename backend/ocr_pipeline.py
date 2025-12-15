@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VISION_MODEL = "gpt-4.1-mini"
+VISION_MODEL = "gpt-4.1"
 
 
 def _client() -> OpenAI:
