@@ -4,13 +4,13 @@ import os
 import re
 from typing import List, Dict, Any, Optional
 
-import fitz  # PyMuPDF
-from openai import OpenAI
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
-VISION_MODEL = "gpt-4.1"
+# Vision-capable model for OCR/extraction
+VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4.1-mini")
 
 
 def _client() -> OpenAI:
@@ -20,6 +20,59 @@ def _client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+# JSOn helpers
+_CODE_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _strip_code_fences(s: str) -> str:
+    return re.sub(_CODE_FENCE_RE, "", s).strip()
+
+
+def _remove_trailing_commas(s: str) -> str:
+    # Remove trailing commas before } or ]
+    return re.sub(r",\s*([}\]])", r"\1", s)
+
+
+def _extract_first_json_blob(s: str) -> str:
+    """
+    Find the first JSON object/array in a string. Handles outputs like:
+    ```json
+    [...]
+    ```
+    or extra preamble text.
+    """
+    s = _strip_code_fences(s)
+
+    # Try direct first
+    try:
+        json.loads(s)
+        return s
+    except Exception:
+        pass
+
+    # Find first { or [
+    start_candidates = [i for i in (s.find("{"), s.find("[")) if i != -1]
+    if not start_candidates:
+        raise json.JSONDecodeError("No JSON object/array found", s, 0)
+    start = min(start_candidates)
+
+    # Find last } or ]
+    end_candidates = [i for i in (s.rfind("}"), s.rfind("]")) if i != -1]
+    if not end_candidates:
+        raise json.JSONDecodeError("No JSON object/array end found", s, start)
+    end = max(end_candidates)
+
+    blob = s[start : end + 1].strip()
+    blob = _remove_trailing_commas(blob)
+    return blob
+
+
+def _loads_loose(raw: str) -> Any:
+    blob = _extract_first_json_blob(raw)
+    return json.loads(blob)
+
+
+# utilities
 def _to_data_url_bytes(b: bytes, mime: str) -> str:
     b64 = base64.b64encode(b).decode("utf-8")
     return f"data:{mime};base64,{b64}"
@@ -39,9 +92,24 @@ def _image_file_to_data_url(path: str) -> str:
 
 
 def _pdf_to_page_data_urls(pdf_path: str, zoom: float = 2.0) -> List[str]:
+    """
+    Converts each PDF page into a PNG data URL using PyMuPDF.
+
+    NOTE:
+    - Requires: pip install pymupdf
+    - Import name is `fitz`
+    """
+    try:
+        import fitz  # PyMuPDF
+    except Exception as e:
+        raise RuntimeError(
+            "PyMuPDF is not installed or not importable. Install with:\n"
+            "  pip install pymupdf\n"
+            f"Original error: {e}"
+        )
+
     doc = fitz.open(pdf_path)
     out: List[str] = []
-
     mat = fitz.Matrix(zoom, zoom)
 
     for i in range(len(doc)):
@@ -53,67 +121,39 @@ def _pdf_to_page_data_urls(pdf_path: str, zoom: float = 2.0) -> List[str]:
     return out
 
 
-def _strip_code_fences(s: str) -> str:
-    s = s.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
-        s = re.sub(r"\s*```$", "", s)
-    return s.strip()
-
-
-def _parse_json_loose(raw: str) -> Any:
-    raw = _strip_code_fences(raw)
-
-    start_idx = None
-    for i, ch in enumerate(raw):
-        if ch in "{[":
-            start_idx = i
-            break
-    if start_idx is None:
-        raise json.JSONDecodeError("No JSON object/array start found", raw, 0)
-
-    candidate = raw[start_idx:]
-    decoder = json.JSONDecoder()
-    obj, _end = decoder.raw_decode(candidate)
-    return obj
-
-
+# OCR extraction
 def _extract_qa_from_one_page(
     client: OpenAI,
     image_data_url: str,
     page_number: Optional[int],
 ) -> List[Dict[str, Any]]:
     prompt = """
-I have a Year 5–8 maths worksheet in the image.
+You are extracting a Year 5–8 maths worksheet from an image.
 
-The page has:
+The page contains:
 - numbered questions
 - handwritten student answers on the same page
 
-I want a clean JSON list of question/answer pairs.
+Return a clean JSON array of question/answer items.
 
-For each numbered question, extract:
-- question_number: like "1", "2(a)" etc
+For each item, extract:
+- question_number: like "1", "2(a)", "3(b)" etc
 - question_text: full question as normal text
 - student_answer: student's final answer (even if wrong)
 - student_working: any visible working/steps
 
 Rules:
-- Ignore headings, name fields, teacher notes.
+- Ignore headings, names, teacher notes, decorations.
 - If answer is unreadable -> student_answer = "UNREADABLE"
 - If there is clearly no answer -> student_answer = "BLANK"
 
-Output:
-Return ONLY a JSON array, like:
+IMPORTANT (multi-problem questions):
+- If a single numbered question contains multiple separate problems (like a list of sums),
+  split them into subparts: "2(a)", "2(b)", "2(c)"... even if the worksheet does not label them.
+  Each subpart should have its own question_text and student_answer.
 
-[
-  {
-    "question_number": "1",
-    "question_text": "...",
-    "student_answer": "...",
-    "student_working": "..."
-  }
-]
+Output:
+Return ONLY a JSON array. Do not wrap in markdown code fences.
 """.strip()
 
     resp = client.responses.create(
@@ -127,13 +167,13 @@ Return ONLY a JSON array, like:
                 ],
             }
         ],
-        max_output_tokens=900,
+        max_output_tokens=1200,
     )
 
     raw = resp.output_text.strip()
 
     try:
-        data = _parse_json_loose(raw)
+        data = _loads_loose(raw)
     except json.JSONDecodeError:
         print("Vision model JSON parse failed. Raw output below:\n")
         print(raw)
@@ -161,7 +201,6 @@ Return ONLY a JSON array, like:
             "student_answer": sans,
             "student_working": work,
         }
-
         if page_number is not None:
             entry["page_number"] = page_number
 
@@ -184,6 +223,7 @@ def extract_qa_from_file(path: str) -> List[Dict[str, Any]]:
 
         return all_items
 
+    # image file
     image_url = _image_file_to_data_url(path)
     return _extract_qa_from_one_page(client, image_url, page_number=None)
 
